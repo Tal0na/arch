@@ -7,6 +7,12 @@ HOSTNAME="talona-vm"
 USUARIO="talona"
 SENHA="123"
 
+# Configurar teclado para o nosso padrão
+loadkeys br-abnt2
+
+# Garantir que o relógio está certo para não dar erro no download dos pacotes
+timedatectl set-ntp true
+
 echo "--- Iniciando Instalação Arch KDE Minimal ---"
 
 # 1. Preparação de Disco

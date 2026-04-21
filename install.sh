@@ -1,89 +1,294 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+# =============================================================================
+#  install.sh — Instalador Arch Linux
+#  Boot: UEFI | FS: ext4 | Bootloader: Limine | DE: KDE minimal
+#  Uso: rode pelo live ISO do Arch
+# =============================================================================
 
-# Configurações de hardware (Ajuste conforme a VM)
-DISCO="/dev/vda"
-HOSTNAME="talona-vm"
-USUARIO="talona"
-SENHA="123"
+set -euo pipefail
 
-# Configurar teclado para o nosso padrão
-loadkeys br-abnt2
+# ─── Cores ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
 
-# Garantir que o relógio está certo para não dar erro no download dos pacotes
-timedatectl set-ntp true
+info()  { echo -e "${CYAN}[INFO]${RESET}  $*"; }
+ok()    { echo -e "${GREEN}[OK]${RESET}    $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
+err()   { echo -e "${RED}[ERRO]${RESET}  $*" >&2; exit 1; }
 
-echo "--- Iniciando Instalação Arch KDE Minimal ---"
+header() {
+    echo -e "\n${BOLD}${BLUE}══════════════════════════════════════${RESET}"
+    echo -e "${BOLD}${BLUE}  $*${RESET}"
+    echo -e "${BOLD}${BLUE}══════════════════════════════════════${RESET}\n"
+}
 
-# 1. Preparação de Disco
-wipefs -a "$DISCO"
-parted -s "$DISCO" mklabel gpt
-parted -s "$DISCO" mkpart primary fat32 1MiB 513MiB
-parted -s "$DISCO" set 1 esp on
-parted -s "$DISCO" mkpart primary ext4 513MiB 100%
+banner() {
+    clear
+    echo -e "${BOLD}${BLUE}"
+    echo "  ████████╗ █████╗ ██╗      ██████╗ ███╗   ██╗  █████╗ "
+    echo "     ██╔══╝██╔══██╗██║     ██╔═══██╗████╗  ██║ ██╔══██╗"
+    echo "     ██║   ███████║██║     ██║   ██║██╔██╗ ██║ ███████║"
+    echo "     ██║   ██╔══██║██║     ██║   ██║██║╚██╗██║ ██╔══██║"
+    echo "     ██║   ██║  ██║███████╗╚██████╔╝██║ ╚████║ ██║  ██║"
+    echo "     ╚═╝   ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═╝"
+    echo -e "${RESET}${CYAN}                   arch installer${RESET}"
+    echo
+}
 
-mkfs.fat -F32 "${DISCO}1"
-mkfs.ext4 -F "${DISCO}2"
+# =============================================================================
+#  CONFIGURAÇÃO — edite aqui antes de rodar
+# =============================================================================
 
-# 2. Montagem
-mount "${DISCO}2" /mnt
-mount --mkdir "${DISCO}1" /mnt/boot
+DISK=""           # deixe vazio para escolher interativamente
+HOSTNAME="arch"
+USERNAME="tales"
+TIMEZONE="America/Sao_Paulo"
+LOCALE="pt_BR.UTF-8"
+KEYMAP="br-abnt2"
+LANG_EXTRA="en_US.UTF-8"
 
-# 3. Pacstrap (Base + Drivers + KDE Minimal)
-# Instalando apenas o essencial do Plasma para manter leve
-echo "Baixando pacotes (isso pode demorar)..."
-pacstrap -K /mnt \
-    base base-devel linux linux-firmware \
-    nano git networkmanager pipewire pipewire-pulse \
-    limine efibootmgr \
-    xorg-server \
-    plasma-desktop sddm konsole dolphin \
+# Pacotes base extras (além do base/base-devel)
+EXTRA_PACKAGES=(
+    linux-headers
+    networkmanager
+    network-manager-applet
+    pipewire pipewire-alsa pipewire-pulse pipewire-jack wireplumber
+    git curl wget
+    htop btop
+    neovim
+    bash-completion
+    reflector
+    pacman-contrib
+    # VM support
+    virtualbox-guest-utils
+    open-vm-tools
+    # KDE minimal
+    plasma-desktop
+    plasma-pa
+    plasma-nm
+    dolphin
+    konsole
+    sddm
+    xorg-server
+    # Fontes
+    ttf-jetbrains-mono-nerd
     noto-fonts
+)
 
-# 4. Gerar FSTAB
-genfstab -U /mnt >> /mnt/etc/fstab
+# =============================================================================
+#  FUNÇÕES
+# =============================================================================
 
-# 5. Configuração Interna (Chroot)
-echo "Entrando no sistema para configurações finais..."
+check_uefi() {
+    [[ -d /sys/firmware/efi ]] || err "Sistema não iniciou em modo UEFI. Use a ISO em modo UEFI."
+    ok "Modo UEFI detectado."
+}
 
-arch-chroot /mnt /bin/bash <<EOF
-    # Localização e Relógio
-    ln -sf /usr/share/zoneinfo/America/Sao_Paulo /etc/localtime
-    hwclock --systohc
-    echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
-    locale-gen
-    echo "LANG=en_US.UTF-8" > /etc/locale.conf
-    echo "$HOSTNAME" > /etc/hostname
+check_internet() {
+    info "Verificando conexão..."
+    ping -c 1 archlinux.org &>/dev/null || err "Sem conexão com a internet."
+    ok "Internet OK."
+}
 
-    # Criação de Usuário
-    useradd -m -G wheel "$USUARIO"
-    echo "root:$SENHA" | chpasswd
-    echo "$USUARIO:$SENHA" | chpasswd
-    echo "%wheel ALL=(ALL:ALL) ALL" >> /etc/sudoers
+select_disk() {
+    if [[ -n "$DISK" ]]; then
+        info "Disco definido manualmente: $DISK"
+        return
+    fi
 
-    # Habilitar Serviços (Rede e Interface Gráfica)
-    systemctl enable NetworkManager
-    systemctl enable sddm
+    header "Selecionar Disco"
+    echo -e "${YELLOW}Discos disponíveis:${RESET}\n"
+    lsblk -d -o NAME,SIZE,MODEL | grep -v "loop"
+    echo
+    read -rp "$(echo -e "${YELLOW}Digite o disco (ex: sda, nvme0n1, vda): ${RESET}")" DISK
+    DISK="/dev/$DISK"
 
-    # Configuração do Limine (Bootloader)
-    cp /usr/share/limine/BOOTX64.EFI /boot/
+    [[ -b "$DISK" ]] || err "Disco $DISK não encontrado."
 
-    # Pegar o UUID do disco para o boot
-    UUID_RAIZ=\$(blkid -s UUID -o value ${DISCO}2)
+    echo -e "\n${RED}${BOLD}ATENÇÃO: $DISK será completamente apagado!${RESET}"
+    read -rp "$(echo -e "${YELLOW}Confirmar? [s/N]: ${RESET}")" ans
+    [[ "${ans,,}" == "s" ]] || { warn "Cancelado."; exit 0; }
+}
 
-    cat > /boot/limine.conf <<CFG
-TIMEOUT=3
-SERIAL=yes
+partition_disk() {
+    header "Particionando $DISK"
 
-:Arch Linux (KDE Minimal)
-    PROTOCOL=linux
-    KERNEL_PATH=boot:///vmlinuz-linux
-    MODULE_PATH=boot:///initramfs-linux.img
-    CMDLINE=root=UUID=\$UUID_RAIZ rw
-CFG
+    # Detectar prefixo de partição (nvme usa p1, p2; sda usa 1, 2)
+    if [[ "$DISK" == *"nvme"* ]] || [[ "$DISK" == *"mmcblk"* ]]; then
+        PART_EFI="${DISK}p1"
+        PART_ROOT="${DISK}p2"
+    else
+        PART_EFI="${DISK}1"
+        PART_ROOT="${DISK}2"
+    fi
 
-    limine bios-install $DISCO
+    info "Criando tabela de partição GPT..."
+    sgdisk --zap-all "$DISK"
+    sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI"  "$DISK"
+    sgdisk -n 2:0:0     -t 2:8300 -c 2:"ROOT" "$DISK"
+    partprobe "$DISK"
+    sleep 1
+
+    ok "Partições criadas: EFI=$PART_EFI  ROOT=$PART_ROOT"
+}
+
+format_partitions() {
+    header "Formatando Partições"
+
+    info "Formatando EFI como FAT32..."
+    mkfs.fat -F32 "$PART_EFI"
+
+    info "Formatando ROOT como ext4..."
+    mkfs.ext4 -F "$PART_ROOT"
+
+    ok "Formatação concluída."
+}
+
+mount_partitions() {
+    header "Montando Partições"
+
+    mount "$PART_ROOT" /mnt
+    mkdir -p /mnt/boot/efi
+    mount "$PART_EFI" /mnt/boot/efi
+
+    ok "Partições montadas."
+}
+
+install_base() {
+    header "Instalando Sistema Base"
+
+    info "Atualizando mirrors..."
+    reflector --latest 10 --sort rate --country Brazil --protocol https \
+        --save /etc/pacman.d/mirrorlist 2>/dev/null || warn "reflector falhou, continuando com mirrors padrão."
+
+    info "Instalando pacotes base..."
+    pacstrap -K /mnt base base-devel linux linux-firmware "${EXTRA_PACKAGES[@]}"
+
+    ok "Sistema base instalado."
+}
+
+configure_system() {
+    header "Configurando Sistema"
+
+    info "Gerando fstab..."
+    genfstab -U /mnt >> /mnt/etc/fstab
+
+    info "Configurando timezone..."
+    arch-chroot /mnt ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+    arch-chroot /mnt hwclock --systohc
+
+    info "Configurando locale..."
+    sed -i "s/^#${LOCALE}/${LOCALE}/" /mnt/etc/locale.gen
+    sed -i "s/^#${LANG_EXTRA}/${LANG_EXTRA}/" /mnt/etc/locale.gen
+    arch-chroot /mnt locale-gen
+    echo "LANG=$LOCALE" > /mnt/etc/locale.conf
+    echo "KEYMAP=$KEYMAP" > /mnt/etc/vconsole.conf
+
+    info "Configurando hostname..."
+    echo "$HOSTNAME" > /mnt/etc/hostname
+    cat > /mnt/etc/hosts <<EOF
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
 EOF
 
-echo "--- Tudo pronto! ---"
-echo "Agora é só desmontar e reiniciar: umount -R /mnt && reboot"
+    ok "Sistema configurado."
+}
+
+install_limine() {
+    header "Instalando Limine Bootloader"
+
+    arch-chroot /mnt pacman -S --noconfirm limine
+
+    # Instalar Limine no disco
+    arch-chroot /mnt limine bios-install "$DISK" 2>/dev/null || true
+
+    # Copiar arquivos do Limine para EFI
+    mkdir -p /mnt/boot/efi/EFI/BOOT
+    cp /mnt/usr/share/limine/BOOTX64.EFI /mnt/boot/efi/EFI/BOOT/
+
+    # Obter UUID da partição root
+    ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT")
+
+    # Criar configuração do Limine
+    cat > /mnt/boot/limine.conf <<EOF
+timeout: 5
+serial: no
+
+/Arch Linux
+    protocol: linux
+    kernel_path: boot():/vmlinuz-linux
+    cmdline: root=UUID=${ROOT_UUID} rw quiet splash
+    module_path: boot():/initramfs-linux.img
+
+/Arch Linux (fallback)
+    protocol: linux
+    kernel_path: boot():/vmlinuz-linux
+    cmdline: root=UUID=${ROOT_UUID} rw
+    module_path: boot():/initramfs-linux-fallback.img
+EOF
+
+    ok "Limine instalado e configurado."
+}
+
+create_user() {
+    header "Criando Usuário"
+
+    info "Criando usuário $USERNAME..."
+    arch-chroot /mnt useradd -m -G wheel,audio,video,storage -s /bin/bash "$USERNAME"
+
+    echo -e "\n${YELLOW}Senha para $USERNAME:${RESET}"
+    arch-chroot /mnt passwd "$USERNAME"
+
+    echo -e "\n${YELLOW}Senha para root:${RESET}"
+    arch-chroot /mnt passwd root
+
+    # Habilitar sudo para wheel
+    sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /mnt/etc/sudoers
+
+    ok "Usuário $USERNAME criado."
+}
+
+enable_services() {
+    header "Habilitando Serviços"
+
+    arch-chroot /mnt systemctl enable NetworkManager
+    arch-chroot /mnt systemctl enable sddm
+    arch-chroot /mnt systemctl enable reflector.timer
+
+    # VM services (só ativa se disponível)
+    arch-chroot /mnt systemctl enable vboxservice 2>/dev/null || true
+    arch-chroot /mnt systemctl enable vmtoolsd 2>/dev/null || true
+
+    ok "Serviços habilitados."
+}
+
+# =============================================================================
+#  MAIN
+# =============================================================================
+
+banner
+
+[[ $EUID -eq 0 ]] || err "Execute como root (você está no live ISO)."
+
+check_uefi
+check_internet
+select_disk
+partition_disk
+format_partitions
+mount_partitions
+install_base
+configure_system
+install_limine
+create_user
+enable_services
+
+echo -e "\n${BOLD}${GREEN}══════════════════════════════════════${RESET}"
+echo -e "${BOLD}${GREEN}  instalação concluída!${RESET}"
+echo -e "${BOLD}${GREEN}══════════════════════════════════════${RESET}"
+echo -e "\n  rode ${CYAN}umount -R /mnt${RESET} e depois ${CYAN}reboot${RESET}\n"

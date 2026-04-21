@@ -44,7 +44,7 @@ banner() {
 #  CONFIGURAÇÃO — edite aqui antes de rodar
 # =============================================================================
 
-DISK=""           # deixe vazio para escolher interativamente
+DISK=""
 HOSTNAME="arch"
 USERNAME="tales"
 TIMEZONE="America/Sao_Paulo"
@@ -52,9 +52,9 @@ LOCALE="pt_BR.UTF-8"
 KEYMAP="br-abnt2"
 LANG_EXTRA="en_US.UTF-8"
 
-# Pacotes base extras (além do base/base-devel)
 EXTRA_PACKAGES=(
     linux-headers
+    efibootmgr
     networkmanager
     network-manager-applet
     pipewire pipewire-alsa pipewire-pulse pipewire-jack wireplumber
@@ -118,7 +118,6 @@ select_disk() {
 partition_disk() {
     header "Particionando $DISK"
 
-    # Detectar prefixo de partição (nvme usa p1, p2; sda usa 1, 2)
     if [[ "$DISK" == *"nvme"* ]] || [[ "$DISK" == *"mmcblk"* ]]; then
         PART_EFI="${DISK}p1"
         PART_ROOT="${DISK}p2"
@@ -132,30 +131,25 @@ partition_disk() {
     sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI"  "$DISK"
     sgdisk -n 2:0:0     -t 2:8300 -c 2:"ROOT" "$DISK"
     partprobe "$DISK"
-    sleep 1
+    sleep 2
 
     ok "Partições criadas: EFI=$PART_EFI  ROOT=$PART_ROOT"
 }
 
 format_partitions() {
     header "Formatando Partições"
-
     info "Formatando EFI como FAT32..."
     mkfs.fat -F32 "$PART_EFI"
-
     info "Formatando ROOT como ext4..."
     mkfs.ext4 -F "$PART_ROOT"
-
     ok "Formatação concluída."
 }
 
 mount_partitions() {
     header "Montando Partições"
-
     mount "$PART_ROOT" /mnt
     mkdir -p /mnt/boot/efi
     mount "$PART_EFI" /mnt/boot/efi
-
     ok "Partições montadas."
 }
 
@@ -164,11 +158,10 @@ install_base() {
 
     info "Atualizando mirrors..."
     reflector --latest 10 --sort rate --country Brazil --protocol https \
-        --save /etc/pacman.d/mirrorlist 2>/dev/null || warn "reflector falhou, continuando com mirrors padrão."
+        --save /etc/pacman.d/mirrorlist 2>/dev/null || warn "reflector falhou, continuando."
 
     info "Instalando pacotes base..."
     pacstrap -K /mnt base base-devel linux linux-firmware "${EXTRA_PACKAGES[@]}"
-
     ok "Sistema base instalado."
 }
 
@@ -205,25 +198,35 @@ install_limine() {
 
     arch-chroot /mnt pacman -S --noconfirm limine
 
-    # Instalar Limine no disco
-    arch-chroot /mnt limine bios-install "$DISK" 2>/dev/null || true
-
-    # Copiar arquivos do Limine para EFI
+    # Copiar EFI
     mkdir -p /mnt/boot/efi/EFI/BOOT
-    cp /mnt/usr/share/limine/BOOTX64.EFI /mnt/boot/efi/EFI/BOOT/
+    cp /mnt/usr/share/limine/BOOTX64.EFI /mnt/boot/efi/EFI/BOOT/BOOTX64.EFI
 
-    # Obter UUID da partição root
+    # Registrar entrada UEFI
+    local disk_short
+    disk_short=$(basename "$DISK")
+    local part_num
+    part_num=$(echo "$PART_EFI" | grep -o '[0-9]*$')
+
+    efibootmgr \
+        --create \
+        --disk "$DISK" \
+        --part "$part_num" \
+        --label "Limine" \
+        --loader "\\EFI\\BOOT\\BOOTX64.EFI" \
+        --verbose
+
+    # UUID da partição root
     ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT")
 
-    # Criar configuração do Limine
-    cat > /mnt/boot/limine.conf <<EOF
+    # Configuração do Limine
+    cat > /mnt/boot/efi/limine.conf <<EOF
 timeout: 5
-serial: no
 
 /Arch Linux
     protocol: linux
     kernel_path: boot():/vmlinuz-linux
-    cmdline: root=UUID=${ROOT_UUID} rw quiet splash
+    cmdline: root=UUID=${ROOT_UUID} rw quiet
     module_path: boot():/initramfs-linux.img
 
 /Arch Linux (fallback)
@@ -233,13 +236,17 @@ serial: no
     module_path: boot():/initramfs-linux-fallback.img
 EOF
 
-    ok "Limine instalado e configurado."
+    # Copiar kernel e initramfs para a EFI também (garantia)
+    cp /mnt/boot/vmlinuz-linux /mnt/boot/efi/
+    cp /mnt/boot/initramfs-linux.img /mnt/boot/efi/
+    cp /mnt/boot/initramfs-linux-fallback.img /mnt/boot/efi/
+
+    ok "Limine instalado e registrado no UEFI."
 }
 
 create_user() {
     header "Criando Usuário"
 
-    info "Criando usuário $USERNAME..."
     arch-chroot /mnt useradd -m -G wheel,audio,video,storage -s /bin/bash "$USERNAME"
 
     echo -e "\n${YELLOW}Senha para $USERNAME:${RESET}"
@@ -248,9 +255,7 @@ create_user() {
     echo -e "\n${YELLOW}Senha para root:${RESET}"
     arch-chroot /mnt passwd root
 
-    # Habilitar sudo para wheel
     sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /mnt/etc/sudoers
-
     ok "Usuário $USERNAME criado."
 }
 
@@ -260,10 +265,8 @@ enable_services() {
     arch-chroot /mnt systemctl enable NetworkManager
     arch-chroot /mnt systemctl enable sddm
     arch-chroot /mnt systemctl enable reflector.timer
-
-    # VM services (só ativa se disponível)
-    arch-chroot /mnt systemctl enable vboxservice 2>/dev/null || true
-    arch-chroot /mnt systemctl enable vmtoolsd 2>/dev/null || true
+    arch-chroot /mnt systemctl enable vboxservice  2>/dev/null || true
+    arch-chroot /mnt systemctl enable vmtoolsd     2>/dev/null || true
 
     ok "Serviços habilitados."
 }
